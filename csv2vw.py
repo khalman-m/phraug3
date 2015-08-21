@@ -103,9 +103,6 @@ class FormatConverter(object):
         for key in feature_count_dict:
             if feature_count_dict[key] >= min_shows:
                 features_to_use.add(key)
-        print feature_count_dict
-        print features_to_use
-
         return features_to_use
 
     def clean(self, item, filter_features=False, col_name=None):
