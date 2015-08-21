@@ -5,18 +5,68 @@
 import sys
 import os
 import csv
+import itertools
 import argparse
 
 
-class LineConverter(object):
-    def __init__(self, filesize, col_names=None, convert_zeros=False, label_index=0, real_valued=None, ignore_columns=None):
-        self.filesize = filesize
+class AdvancedReader(object):
+    def __init__(self, filename, **args):
+        if args.pop('tsv'):
+            sep = '\t'
+        else:
+            sep = ','
+
+        in_file = open(filename)
+        filesize = os.path.getsize(filename)
         self.bytes_counter = 0
         self.line_counter = 0
+
+        self.reader = csv.reader(in_file, delimiter=sep)
+
+        if args.pop('parse_header'):
+            header = self.reader.next()
+            col_names = [''.join(x.split(' ')) for x in header]
+            filesize -= sum(len(x) for x in header)
+        else:
+            col_names = None
+
+        self.filesize = filesize
+        self.col_names = col_names
+
+    @staticmethod
+    def update_progress(progress, suffix=''):
+        hashes_n = 20
+        line = '#' * int(progress * hashes_n) + '_' * int((1 - progress) * hashes_n)
+        sys.stdout.write('\r[{0}] {1}%'.format(line, int(100 * progress)) + suffix)
+        sys.stdout.flush()
+
+    def get_col_names(self):
+        return self.col_names
+
+    def next(self):
+        self.line_counter += 1
+        if self.line_counter % 10000 == 0:
+            self.update_progress(float(self.bytes_counter) / self.filesize)
+        self.bytes_counter += 2  # 2 for \n and \r
+        return self.reader.next()
+
+    def __iter__(self):
+        return self
+
+    def __del__(self):
+        self.update_progress(1.0, '\n')
+
+
+class FormatConverter(object):
+    def __init__(self, input_file, output_file, col_names=None, convert_zeros=False, label_index=0, real_valued=None, min_shows=1, ignore_columns=None, **args):
         self.convert_zeros = convert_zeros
         self.label_index = label_index
-        self.col_names = col_names
-        self.col_names.pop(label_index)
+
+        self.reader = AdvancedReader(input_file, **args)
+        self.col_names = self.reader.get_col_names()
+        self.col_names.pop(self.label_index)
+
+        self.out_file = open(output_file, 'w')
 
         if real_valued is None:
             self.real_valued = set()
@@ -28,16 +78,41 @@ class LineConverter(object):
         else:
             self.ignore_columns = set(map(int, ignore_columns.split(',')))
 
-    @staticmethod
-    def update_progress(progress, suffix=''):
-        hashes_n = 20
-        line = '#' * int(progress * hashes_n) + '_' * int((1 - progress) * hashes_n)
-        sys.stdout.write('\r[{0}] {1}%'.format(line, int(100 * progress)) + suffix)
-        sys.stdout.flush()
+        if min_shows > 1:
+            self.filter_features = True
+            self.features_to_use = self.calculate_features_to_use(min_shows)
+            self.reader = AdvancedReader(input_file, **args)
+        else:
+            self.filter_features = False
 
-    @staticmethod
-    def clean(item):
-        return item.replace("|", "").replace(":", "")
+    def calculate_features_to_use(self, min_shows):
+        print 'Calculating occurences of all features...'
+        feature_count_dict = dict()
+        for line in self.reader:
+            line.pop(self.label_index)
+            for (i, item) in enumerate(line):
+                if i in self.ignore_columns:
+                    continue
+                for feature in item.split(' '):
+                    feature_with_name = self.col_names[i] + '|' + feature
+                    if feature_with_name not in feature_count_dict:
+                        feature_count_dict[feature_with_name] = 1
+                    else:
+                        feature_count_dict[feature_with_name] += 1
+        features_to_use = set()
+        for key in feature_count_dict:
+            if feature_count_dict[key] >= min_shows:
+                features_to_use.add(key)
+        print feature_count_dict
+        print features_to_use
+
+        return features_to_use
+
+    def clean(self, item, filter_features=False, col_name=None):
+        item = item.replace("|", "").replace(":", "") # clean trash
+        if filter_features:
+            item = ' '.join([x for x in item.split(' ') if (col_name + '|' + x) in self.features_to_use])
+        return item
 
     def handle_label(self, label):
         try:
@@ -60,11 +135,6 @@ class LineConverter(object):
         return label
 
     def construct_line(self, line):
-        self.line_counter += 1
-        if self.line_counter % 10000 == 0:
-            self.update_progress(float(self.bytes_counter) / self.filesize)
-        self.bytes_counter += 2  # 2 for \n and \r
-
         new_line = list()
         label = line.pop(self.label_index)
         new_line.append(self.handle_label(label))
@@ -75,12 +145,11 @@ class LineConverter(object):
             self.col_names.pop(self.label_index)
 
         for i, item in enumerate(line):
-            self.bytes_counter += len(item) + 1
             if i in self.ignore_columns:
                 continue
-
             if i not in self.real_valued:
-                new_item = "|{} {}".format(self.col_names[i], self.clean(item))
+                item = self.clean(item, filter_features=True, col_name=self.col_names[i])
+                new_item = "|{} {}".format(self.col_names[i], item)
                 new_line.append(new_item)
             else:
                 try:
@@ -101,8 +170,11 @@ class LineConverter(object):
         new_line += "\n"
         return new_line
 
-    def __del__(self):
-        self.update_progress(1.0, '\n')
+    def convert(self):
+        print 'Converting...'
+        for line in self.reader:
+            new_line = self.construct_line(line)
+            self.out_file.write(new_line)
 
 
 def parse_args():
@@ -141,6 +213,13 @@ def parse_args():
         "--real_valued",
         help="zero-based index(es) of columns to treat as real-valued.")
 
+    parser.add_argument(
+        "-m",
+        "--min_shows",
+        type=int,
+        default=1,
+        help="min_shows filtering")
+
     parser.add_argument("-t", "--tsv", action="store_true", default=False,
                         help="for tsv files instead of csv - default false")
 
@@ -152,28 +231,8 @@ def parse_args():
 def main():
     args = parse_args()
 
-    if args.pop('tsv'):
-        sep = '\t'
-    else:
-        sep = ','
-
-    input_filename = args.pop('input_file')
-    in_file = open(input_filename)
-    filesize = os.path.getsize(input_filename)
-    out_file = open(args.pop('output_file'), 'wb')
-
-    reader = csv.reader(in_file, delimiter=sep)
-    if args.pop('parse_header'):
-        header = reader.next()
-        col_names = [''.join(x.split(' ')) for x in header]
-        filesize -= sum(len(x) for x in header)
-    else:
-        col_names = None
-
-    constructor = LineConverter(col_names=col_names, filesize=filesize, **args)
-    for line in reader:
-        new_line = constructor.construct_line(line)
-        out_file.write(new_line)
+    converter = FormatConverter(**args)
+    converter.convert()
 
 if __name__ == "__main__":
     main()
